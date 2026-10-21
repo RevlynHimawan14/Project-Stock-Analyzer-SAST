@@ -1,0 +1,1535 @@
+﻿import "server-only";
+
+import type { BacktestData, StockResearchData, FinancialPeriod, ValuationMethod, StockPrice, AnnualRatioMetric, QuarterlyQualityMetric, ValuationSummary } from "@/lib/stock-data";
+import type { BacktestCase, EvidenceOutcomeBreakdown, StockDetail } from "@/data/stock-detail-types";
+import { toMonthIndex, toMonthLabel } from "@/utils/dates";
+import { formatRupiah } from "@/utils/currency";
+import { sortValuationMethods, valuationMethodDescription, valuationMethodLabel, type ValuationMethodCode } from "@/lib/valuation-methods";
+import { buildBacktestCase } from "@/lib/backtest-adapter";
+import {
+  buildHistoricalEvidencePreview,
+  EVIDENCE_RATE_UNAVAILABLE,
+  evidenceWinRatePercent,
+  formatEvidencePercent,
+} from "@/lib/analysis";
+
+const UNAVAILABLE = "Not available";
+
+function mapVerdict(dbVerdict: string | null | undefined): StockDetail["verdict"] {
+  switch (dbVerdict) {
+    case "UNDERVALUED":
+      return "Undervalued";
+    case "OVERVALUED":
+      return "Overvalued";
+    case "AT_FAIR_VALUE":
+      return "Fairly Valued";
+    default:
+      return "Not available";
+  }
+}
+
+function mapSummaryVerdict(
+  value: string | null | undefined,
+): StockDetail["currentValuation"]["methodVerdict"] {
+  if (value === "UNDERVALUED" || value === "OVERVALUED" || value === "N/A") return value;
+  return null;
+}
+
+/**
+ * Pick the row that carries the "Main" badge and supplies the headline IV / MoS.
+ *
+ * The workbook's main rule for the stock type wins when it has a usable value.
+ * When it does not (`IV <= 0`), the **other** main-rule candidate takes over
+ * instead of leaving the headline empty: the two candidates are the same pair
+ * the workbook offers for `SUMMARY!B69`, so the fallback stays inside the
+ * documented rule set rather than inventing a new one.
+ *
+ * GEMA is the case that motivated this: it is a `TURN AROUND`, so Peter Lynch is
+ * its main rule, but Peter Lynch values it at `âˆ’22`. Its headline therefore comes
+ * from Weighted IV (`32.74`), and the badge moves with it â€” otherwise the table
+ * would show "Main" on a row whose number nothing else uses.
+ *
+ * A stock with no usable value from either candidate keeps `null`, so the screen
+ * reports "not available" instead of picking a method at random.
+ */
+/**
+ * Margin of safety for one method, **read from the stored row**.
+ *
+ * The backend computes `(IV âˆ’ price) / IV` (workbook `SUMMARY`, D6) and stores it
+ * on `calc_valuation_methods.mos`. The UI used to recompute it here, which meant
+ * two implementations of one rule and a figure n8n could not see. The stored
+ * value is used as-is; when it is `null` the row's `flags` say why
+ * (`MOS_DENOMINATOR_ZERO` for `IV = 0`, `MOS_NOT_APPLICABLE` for `IV < 0`, whose
+ * negative divisor would flip the sign of the ratio and read as a large discount
+ * when the model values the company far *below* its price).
+ *
+ * The `* 100` is presentation only: the database stores a ratio, and the UI shows
+ * a percentage.
+ */
+function formatStoredMos(method: ValuationMethod): number | null {
+  if (method.mos == null) return null;
+  return method.mos * 100;
+}
+
+/** Transitional legacy-reader mapping. New frequency RPCs always supply their
+ * authoritative Based Method; this branch is only used until safe backfill. */
+function legacyMainMethod(methods: ValuationMethod[], stockType: string): ValuationMethod | null {
+  const preferredCode = stockType.trim().toLowerCase() === "stalwart" || stockType.trim().toLowerCase() === "fast grower"
+    ? "TYPE_SECTOR_WEIGHTED" : "PETER_LYNCH";
+  const alternativeCode = preferredCode === "PETER_LYNCH" ? "TYPE_SECTOR_WEIGHTED" : "PETER_LYNCH";
+  const usable = (code: string) => methods.find((method) =>
+    method.methodCode === code && method.intrinsicValue != null && method.intrinsicValue > 0,
+  );
+  return usable(preferredCode) ?? usable(alternativeCode) ?? null;
+}
+
+function methodDisplayName(methodCode: string): string {
+  return valuationMethodLabel(methodCode);
+}
+
+/**
+ * Status shown for one valuation-method row.
+ *
+ * The two non-positive cases are treated **differently on purpose**, mirroring
+ * the backtest engine (decision D5 in `docs/BACKTEST_ARCHITECTURE.md`):
+ *
+ *   * `IV = 0` â€” the model produced nothing (DDM for a company that has never
+ *     paid a dividend), so it is `SKIPPED` and kept out of the comparison. The
+ *     backtest drops these rows from its consensus denominator for the same
+ *     reason: a stock without dividends yields `3|4`, not `3|5`.
+ *   * `IV < 0` â€” the model *did* produce a value, and a negative one is a real
+ *     statement (the company is worth less than nothing by that model), so it
+ *     stays `OVERVALUED`. The backtest keeps these rows valid and counts them
+ *     the same way.
+ *
+ * Only the margin of safety is withheld for `IV < 0`, because `(IV âˆ’ price)/IV`
+ * flips sign when the divisor is negative. The status is not withheld.
+ */
+function methodStatus(
+  intrinsicValue: number,
+  storedVerdict: string,
+): import("@/data/stock-detail-types").ValuationMethodStatus {
+  if (intrinsicValue === 0) return "SKIPPED";
+  if (intrinsicValue < 0) return "OVERVALUED";
+  if (storedVerdict === "NOT_APPLICABLE") return "SKIPPED";
+  return storedVerdict === "UNDERVALUED" ? "UNDERVALUED" : "OVERVALUED";
+}
+
+/**
+ * Display form of a Historical Evidence headline. `null` (no Undervalued case,
+ * or no backtest at all) becomes `EVIDENCE_RATE_UNAVAILABLE` rather than `0%`,
+ * which would read as "the thesis failed every time".
+ */
+function formatEvidenceWinRate(
+  breakdown: EvidenceOutcomeBreakdown | undefined,
+): string {
+  if (!breakdown) return EVIDENCE_RATE_UNAVAILABLE;
+  const percent = evidenceWinRatePercent(breakdown);
+  return percent == null
+    ? EVIDENCE_RATE_UNAVAILABLE
+    : formatEvidencePercent(percent);
+}
+
+function formatPercentSigned(value: number | null): string {
+  if (value == null || !Number.isFinite(value)) return UNAVAILABLE;
+  const sign = value > 0 ? "+" : "";
+  return `${sign}${value.toFixed(2).replace(".", ",")}%`;
+}
+
+function formatCagr(value: number | null): string {
+  if (value == null || !Number.isFinite(value)) return UNAVAILABLE;
+  return `${(value * 100).toFixed(1).replace(".", ",")}%`;
+}
+
+/**
+ * Interest expense is stored in full IDR. The workbook's "M Rp" columns are
+ * actually **billions** of IDR (see docs/reference/EXCEL_POSTGRES_VALIDATION.md
+ * Â§"Unit reality check": `1 template unit = 1,000,000,000 IDR`), so the value is
+ * scaled by 1e9 to reproduce the workbook number exactly â€” e.g. AUTO 2026-Q2
+ * 9,224,000,000 IDR -> 9,224.
+ */
+function formatInterestExpense(value: number | null): string {
+  if (value == null || !Number.isFinite(value)) return UNAVAILABLE;
+  return (value / 1_000_000_000).toFixed(2).replace(".", ",");
+}
+
+function badgeFromGrowth(value: number | null): "Positive" | "Stable" | "Caution" {
+  if (value == null) return "Stable";
+  if (value > 0.05) return "Positive";
+  if (value < 0) return "Caution";
+  return "Stable";
+}
+
+function findAnnualMetric(
+  data: StockResearchData,
+  code: string,
+): { value: number | null; periodLabel: string } {
+  const rows = data.annualGrowth.filter((row) => row.metricCode === code);
+  const latest = rows.at(-1);
+  return { value: latest?.value ?? null, periodLabel: latest?.periodLabel ?? UNAVAILABLE };
+}
+
+function findQuarterlyMetric(
+  data: StockResearchData,
+  code: string,
+): { value: number | null; periodLabel: string } {
+  const rows = data.quarterlyQuality.filter((row) => row.metricCode === code);
+  const latest = rows.at(-1);
+  return { value: latest?.value ?? null, periodLabel: latest?.periodLabel ?? UNAVAILABLE };
+}
+
+function trendToneFromValue(value: number | null): "green" | "slate" | "yellow" | "red" {
+  if (value == null) return "slate";
+  if (value > 0) return "green";
+  if (value < 0) return "red";
+  return "slate";
+}
+
+const METRIC_LABELS: Record<string, string> = {
+  REVENUE: "Revenue",
+  EARNINGS: "Net Income",
+  GROSS_PROFIT: "Gross Profit",
+  COST_OF_REVENUE: "Cost of Revenue",
+  OPERATING_CASH_FLOW: "Operating Cash Flow",
+  TOTAL_CURRENT_ASSET: "Total Current Assets",
+  CURRENT_LIABILITIES: "Current Liabilities",
+  TOTAL_ASSETS: "Total Assets",
+  TOTAL_LIABILITIES: "Total Liabilities",
+  TOTAL_EQUITY: "Total Equity",
+  OUTSTANDING_SHARES: "Outstanding Shares",
+};
+
+function factValue(period: FinancialPeriod | undefined, code: string): number | null {
+  return period?.facts.find((f) => f.metricCode === code)?.value ?? null;
+}
+
+function toRpTrillion(value: number | null): number {
+  if (value == null) return 0;
+  return value / 1_000_000_000_000;
+}
+
+function buildFinancialHistory(
+  periods: FinancialPeriod[],
+  ratios: AnnualRatioMetric[],
+  quality: QuarterlyQualityMetric[],
+): StockDetail["financialHistory"] {
+  const annualPeriods = periods
+    .filter((p) => p.periodType === "ANNUAL")
+    .sort((a, b) => a.periodEnd.localeCompare(b.periodEnd));
+  const quarterlyPeriods = periods
+    .filter((p) => p.periodType === "QUARTER")
+    .sort((a, b) => a.periodEnd.localeCompare(b.periodEnd))
+    .slice(-8);
+
+  if (annualPeriods.length === 0) return undefined;
+
+  const yearLabel = (p: FinancialPeriod) => p.periodLabel;
+
+  // A series only carries periods where the metric actually exists, so a chart
+  // can never draw a fake zero for a year whose fact is missing.
+  const buildSeries = (metricCode: string, source: FinancialPeriod[]) =>
+    source
+      .map((p) => ({ year: yearLabel(p), value: factValue(p, metricCode) }))
+      .filter((point): point is { year: string; value: number } => point.value != null)
+      .map((point) => ({ year: point.year, value: toRpTrillion(point.value) }));
+
+  const latestAnnual = annualPeriods.at(-1)!;
+
+  // The displayed window spans `length - 1` year-over-year steps, which is what
+  // a CAGR must divide by. The label used to print `length` ("CAGR (7Y)" for six
+  // steps), overstating every rate it described.
+  const yearsSpanned = Math.max(annualPeriods.length - 1, 0);
+
+  const perYear = (fn: (period: FinancialPeriod, index: number) => number | null) =>
+    annualPeriods.map((period, index) => fn(period, index));
+
+  /** A raw fact per year, e.g. revenue or total equity. */
+  const factSeries = (metricCode: string) =>
+    perYear((period) => factValue(period, metricCode));
+
+  /**
+   * A stored annual ratio per year, read from `calc_annual_ratios`.
+   *
+   * These used to be recomputed here (`ratioSeries`, `perShareSeries`,
+   * `windowCagr`). They now come from the database so the UI and n8n read one
+   * number, and so EPS uses the workbook's single `=Proj_Shares` divisor rather
+   * than a per-year share count. `null` is the stored "unavailable" state and is
+   * rendered as "Not available"; the row's `flags` carry the reason.
+   */
+  const ratioByYear = (metricCode: string): Record<string, number | null> => {
+    const map: Record<string, number | null> = {};
+    for (const row of ratios) {
+      if (row.metricCode === metricCode) map[row.periodLabel] = row.value;
+    }
+    return map;
+  };
+
+  /** A stored ratio aligned to the displayed annual periods. */
+  const storedRatioSeries = (metricCode: string) => {
+    const byYear = ratioByYear(metricCode);
+    return annualPeriods.map((period) => byYear[yearLabel(period)] ?? null);
+  };
+
+  /** The stored window CAGR, formatted. */
+  const storedCagr = (metricCode: string): string => {
+    const byYear = ratioByYear(metricCode);
+    const latest = byYear[yearLabel(latestAnnual)];
+    return latest == null ? UNAVAILABLE : formatCagr(latest);
+  };
+
+  const money = (value: number | null) =>
+    value == null ? UNAVAILABLE : toRpTrillion(value).toFixed(2);
+  const amount = (value: number | null) =>
+    value == null ? UNAVAILABLE : value.toFixed(2);
+  const percent1 = (value: number | null) =>
+    value == null ? UNAVAILABLE : `${(value * 100).toFixed(1).replace(".", ",")}%`;
+
+  // The EPS series is the stored per-year EPS, so the chart and the table show
+  // the same number the database holds. Years the backend could not compute are
+  // skipped rather than drawn as a zero.
+  const epsValues = storedRatioSeries("EPS");
+  const epsSeries = annualPeriods
+    .map((p, index) => ({ year: yearLabel(p), value: epsValues[index] }))
+    .filter((point): point is { year: string; value: number } => point.value != null);
+
+  const cagrLabel = yearsSpanned > 0 ? `CAGR (${yearsSpanned}Y)` : "CAGR";
+
+  const annualTrendCards: NonNullable<StockDetail["financialHistory"]>["annualTrendCards"] = [
+    {
+      id: "revenue",
+      title: "Revenue",
+      unit: "Rp Trillion",
+      latestValue: toRpTrillion(factValue(latestAnnual, "REVENUE")).toFixed(2),
+      cagrLabel,
+      cagrValue: storedCagr("REVENUE_CAGR_WINDOW"),
+      subtext: "Annual revenue trend",
+      series: buildSeries("REVENUE", annualPeriods),
+    },
+    {
+      id: "netIncome",
+      title: "Net Income",
+      unit: "Rp Trillion",
+      latestValue: toRpTrillion(factValue(latestAnnual, "EARNINGS")).toFixed(2),
+      cagrLabel,
+      cagrValue: storedCagr("EARNINGS_CAGR_WINDOW"),
+      subtext: "Annual net income trend",
+      series: buildSeries("EARNINGS", annualPeriods),
+    },
+    {
+      id: "eps",
+      title: "Earnings per Share (EPS)",
+      unit: "Rp per share",
+      latestValue:
+        storedRatioSeries("EPS").at(-1)?.toFixed(2) ?? UNAVAILABLE,
+      cagrLabel,
+      cagrValue: storedCagr("EARNINGS_CAGR_WINDOW"),
+      subtext: "Earnings / outstanding shares",
+      series: epsSeries,
+    },
+  ];
+
+  // --- Annual table ---------------------------------------------------------
+  // Rows follow the workbook template (income statement + balance sheet in
+  // `DataInput`) instead of only the five raw facts the table used to show, so
+  // the ratios the workbook reports - EPS, BVPS, ROE and the two margins - are
+  // visible again.
+  //
+  // The right-hand column is a real CAGR over the displayed window. It used to
+  // read "YoY Change" while actually computing the *total* change between the
+  // first and last year: for ERAA revenue 2019 -> 2025 that printed +132,53%
+  // under a year-over-year label, which is a different number.
+  const seriesRow = (
+    metric: string,
+    series: (number | null)[],
+    format: (value: number | null) => string,
+    // A ratio is a level, not a stock, so the workbook leaves its CAGR blank.
+    withCagr = true,
+    // The stored window CAGR for the row, when the backend has one. Reading it
+    // rather than recomputing keeps the right-hand column identical to what n8n
+    // sees, and honours the backend's refusal (ARII and GOLD start in a loss).
+    cagrMetric?: string,
+  ) => ({
+    metric,
+    values: series.map(format),
+    change: withCagr
+      ? cagrMetric
+        ? storedCagr(cagrMetric)
+        : windowCagrOf(series)
+      : "-",
+  });
+
+  /**
+   * Fallback CAGR for rows the backend does not store a window CAGR for.
+   *
+   * Only used for rows like Gross Profit, which the workbook does not report a
+   * CAGR for. Both endpoints must be positive, so a series that starts or ends in
+   * a loss reports "Not available" rather than an imaginary root of a negative
+   * number.
+   */
+  const windowCagrOf = (series: (number | null)[]): string => {
+    const first = series[0];
+    const last = series[series.length - 1];
+    if (first == null || last == null || first <= 0 || last <= 0 || yearsSpanned <= 0) {
+      return UNAVAILABLE;
+    }
+    return formatCagr(Math.pow(last / first, 1 / yearsSpanned) - 1);
+  };
+
+  const annualTable: NonNullable<StockDetail["financialHistory"]>["annualTable"] = {
+    periods: annualPeriods.map(yearLabel),
+    changeLabel: yearsSpanned > 0 ? `CAGR (${yearsSpanned}Y)` : "CAGR",
+    rows: [
+      seriesRow("Revenue (Rp T)", factSeries("REVENUE"), money, true, "REVENUE_CAGR_WINDOW"),
+      seriesRow("Gross Profit (Rp T)", factSeries("GROSS_PROFIT"), money),
+      seriesRow("Net Income (Rp T)", factSeries("EARNINGS"), money, true, "EARNINGS_CAGR_WINDOW"),
+      seriesRow("EPS (Rp)", storedRatioSeries("EPS"), amount),
+      // The reported total assets, stored per year. The reconstruction
+      // (`liabilities + equity`) is kept beside it in the database; the reported
+      // figure is the official one and a disagreement is flagged there.
+      seriesRow("Total Assets (Rp T)", factSeries("TOTAL_ASSETS"), money),
+      seriesRow("Total Liabilities (Rp T)", factSeries("TOTAL_LIABILITIES"), money),
+      seriesRow("Total Equity (Rp T)", factSeries("TOTAL_EQUITY"), money),
+      seriesRow("Return on Equity (ROE)", storedRatioSeries("ROE"), percent1, false),
+      seriesRow("Gross Margin", storedRatioSeries("GROSS_MARGIN"), percent1, false),
+      seriesRow("Net Margin", storedRatioSeries("NET_MARGIN"), percent1, false),
+      seriesRow("Book Value per Share (BVPS) (Rp)", storedRatioSeries("BVPS"), amount),
+    ],
+  };
+
+  const quarterlyTable: NonNullable<StockDetail["financialHistory"]>["quarterlyTable"] =
+    quarterlyPeriods.length > 0
+      ? {
+          periods: quarterlyPeriods.map(yearLabel),
+          changeLabel: "QoQ Change",
+          rows: ([
+            "REVENUE",
+            "GROSS_PROFIT",
+            "EARNINGS",
+            "OPERATING_CASH_FLOW",
+            "TOTAL_ASSETS",
+            "TOTAL_LIABILITIES",
+            "TOTAL_EQUITY",
+          ] as const)
+            .map((code) => {
+              const rawValues = quarterlyPeriods.map((p) => factValue(p, code));
+              const previousValue = rawValues.at(-2);
+              const latestValue = rawValues.at(-1);
+              const change =
+                latestValue == null || previousValue == null || previousValue === 0
+                  ? UNAVAILABLE
+                  : formatPercentSigned(
+                      ((latestValue - previousValue) / Math.abs(previousValue)) * 100,
+                    );
+              return {
+                metric: METRIC_LABELS[code] ?? code,
+                values: rawValues.map((value) =>
+                  value == null ? UNAVAILABLE : toRpTrillion(value).toFixed(2),
+                ),
+                change,
+                hasValue: rawValues.some((value) => value != null),
+              };
+            })
+            .filter((row) => row.hasValue)
+            .map(({ metric, values, change }) => ({ metric, values, change })),
+        }
+      : undefined;
+
+  // Quarterly trend cards mirror the annual ones so the Quarterly view of the
+  // Financials tab has real charts instead of an empty grid.
+  const quarterlyTrendCards: NonNullable<StockDetail["financialHistory"]>["quarterlyTrendCards"] =
+    quarterlyPeriods.length > 0
+      ? (
+          [
+            { id: "quarterlyRevenue", code: "REVENUE", title: "Revenue" },
+            { id: "quarterlyNetIncome", code: "EARNINGS", title: "Net Income" },
+            { id: "quarterlyOperatingCashFlow", code: "OPERATING_CASH_FLOW", title: "Operating Cash Flow" },
+          ] as const
+        ).map((card) => {
+          const latest = quarterlyPeriods.at(-1)!;
+          const latestValue = factValue(latest, card.code);
+          const priorYear = quarterlyPeriods.at(-5);
+          const priorValue = priorYear ? factValue(priorYear, card.code) : null;
+          const growth =
+            latestValue != null && priorValue != null && priorValue !== 0
+              ? ((latestValue - priorValue) / Math.abs(priorValue)) * 100
+              : null;
+          return {
+            id: card.id,
+            title: card.title,
+            unit: "Rp Trillion",
+            latestValue: latestValue == null ? UNAVAILABLE : toRpTrillion(latestValue).toFixed(2),
+            cagrLabel: "YoY Growth",
+            cagrValue: formatPercentSigned(growth),
+            subtext:
+              priorYear != null
+                ? `${yearLabel(latest)} vs ${yearLabel(priorYear)}`
+                : "Prior-year quarter not available",
+            series: buildSeries(card.code, quarterlyPeriods),
+          };
+        })
+      : [];
+
+  return {
+    subtitle: `Historical annual and quarterly financials based on ${annualPeriods.length} reported annual period(s).`,
+    annualTrendCards,
+    quarterlyTrendCards,
+    annualMetrics: buildAnnualMetrics(latestAnnual, ratios),
+    quarterlyMetrics: quarterlyPeriods.length > 0 ? buildQuarterlyMetrics(quarterlyPeriods.at(-1)!, quality) : [],
+    annualTable,
+    quarterlyTable,
+  };
+}
+
+/** Key ratio cards for the Financials tab, built from the latest period's facts. */
+function buildAnnualMetrics(
+  period: FinancialPeriod,
+  ratios: AnnualRatioMetric[],
+): NonNullable<StockDetail["financialHistory"]>["annualMetrics"] {
+  const revenue = factValue(period, "REVENUE");
+  const equity = factValue(period, "TOTAL_EQUITY");
+  const liabilities = factValue(period, "TOTAL_LIABILITIES");
+
+  const percent = (value: number | null) =>
+    value == null ? UNAVAILABLE : `${(value * 100).toFixed(2).replace(".", ",")}%`;
+
+  // ROE and the two margins are the stored ratios for this period, so this card
+  // and the annual table cannot disagree.
+  const storedRatio = (metricCode: string): number | null => {
+    const row = ratios.find(
+      (candidate) =>
+        candidate.metricCode === metricCode &&
+        candidate.periodLabel === period.periodLabel,
+    );
+    return row?.value ?? null;
+  };
+
+  return [
+    {
+      label: "Return on Equity (ROE)",
+      value: percent(storedRatio("ROE")),
+      subtext: "Net income / total equity",
+    },
+    {
+      label: "Gross Margin",
+      value: percent(storedRatio("GROSS_MARGIN")),
+      subtext: "Gross profit / revenue",
+    },
+    {
+      label: "Net Margin",
+      value: percent(storedRatio("NET_MARGIN")),
+      subtext: "Net income / revenue",
+    },
+    {
+      label: "Revenue",
+      value: revenue == null ? UNAVAILABLE : toRpTrillion(revenue).toFixed(2),
+      subtext: "Rp Trillion",
+    },
+    {
+      label: "Total Equity",
+      value: equity == null ? UNAVAILABLE : toRpTrillion(equity).toFixed(2),
+      subtext: "Rp Trillion",
+    },
+    {
+      label: "Total Liabilities",
+      value: liabilities == null ? UNAVAILABLE : toRpTrillion(liabilities).toFixed(2),
+      subtext: "Rp Trillion",
+    },
+  ];
+}
+
+function buildQuarterlyMetrics(
+  period: FinancialPeriod,
+  quality: QuarterlyQualityMetric[],
+): NonNullable<StockDetail["financialHistory"]>["quarterlyMetrics"] {
+  const revenue = factValue(period, "REVENUE");
+  const ocf = factValue(period, "OPERATING_CASH_FLOW");
+  const liabilities = factValue(period, "TOTAL_LIABILITIES");
+  const equity = factValue(period, "TOTAL_EQUITY");
+
+  const percent = (value: number | null) =>
+    value == null ? UNAVAILABLE : `${(value * 100).toFixed(2).replace(".", ",")}%`;
+
+  const amount = (value: number | null) =>
+    value == null ? UNAVAILABLE : toRpTrillion(value).toFixed(2);
+
+  // Quarterly margins are the stored `QUALITY_*` ratios for this quarter, the
+  // same rows the Thesis Validator reads, so the two cards cannot disagree.
+  const storedQuality = (metricCode: string): number | null => {
+    const row = quality.find(
+      (candidate) =>
+        candidate.metricCode === metricCode &&
+        candidate.periodLabel === period.periodLabel,
+    );
+    return row?.value ?? null;
+  };
+
+  return [
+    { label: "Revenue", value: amount(revenue), subtext: "Rp Trillion" },
+    { label: "Gross Margin", value: percent(storedQuality("QUALITY_GROSS_MARGIN")), subtext: "Gross profit / revenue" },
+    { label: "Net Margin", value: percent(storedQuality("QUALITY_NET_MARGIN")), subtext: "Net income / revenue" },
+    { label: "Operating Cash Flow", value: amount(ocf), subtext: "Rp Trillion" },
+    { label: "Total Liabilities", value: amount(liabilities), subtext: "Rp Trillion" },
+    { label: "Total Equity", value: amount(equity), subtext: "Rp Trillion" },
+  ];
+}
+
+/**
+ * Build the Growth tab chart series from canonical annual facts.
+ *
+ * Values are converted to Rp Billion so the chart axis stays readable; EPS is the
+ * **stored** annual ratio. Everything else is read from stored facts, and a metric
+ * that is missing for a year yields `null` in the series so the chart can leave an
+ * honest gap instead of drawing a fake zero.
+ */
+function buildGrowthVisuals(data: StockResearchData): StockDetail["healthGrowth"]["growthVisuals"] {
+  const annualPeriods = data.financialPeriods
+    .filter((p) => p.periodType === "ANNUAL")
+    .sort((a, b) => a.periodEnd.localeCompare(b.periodEnd));
+
+  const periods = annualPeriods.map((p) => p.periodLabel);
+
+  const toBillion = (value: number | null): number | null =>
+    value == null ? null : value / 1_000_000_000;
+
+  const series = (metricCode: string) =>
+    annualPeriods.map((p) => toBillion(factValue(p, metricCode)));
+
+  const revenue = series("REVENUE");
+  const netIncome = series("EARNINGS");
+  const operatingCashFlow = series("OPERATING_CASH_FLOW");
+
+  // The stored EPS per year, aligned to the displayed periods. It used to be
+  // recomputed as `earnings / shares` here, which disagreed with the table for
+  // any year whose share count differed from the newest reported one.
+  const epsByYear = new Map(
+    data.annualRatios
+      .filter((row) => row.metricCode === "EPS")
+      .map((row) => [row.periodLabel, row.value] as const),
+  );
+  const eps = annualPeriods.map((p) => epsByYear.get(p.periodLabel) ?? null);
+
+  // Year-over-year growth in percent, relative to the previous year. The first
+  // year has no prior period, so it is reported as unavailable rather than 0.
+  const yoyPercent = (values: (number | null)[]) =>
+    values.map((value, index) => {
+      const prior = index > 0 ? values[index - 1] : null;
+      if (value == null || prior == null || prior === 0) return null;
+      return ((value - prior) / Math.abs(prior)) * 100;
+    });
+
+  return {
+    periods,
+    revenueNetIncome: { revenue, netIncome },
+    operatingCashFlow,
+    eps,
+    growthRate: { revenue: yoyPercent(revenue), eps: yoyPercent(eps) },
+    keyInsights: [],
+  };
+}
+
+function buildThesisValidator(data: StockResearchData): StockDetail["thesisValidator"] {
+  const quarterlyPeriods = [...new Set(data.quarterlyQuality.map((q) => q.periodLabel))]
+    .sort((a, b) => a.localeCompare(b))
+    .slice(-4);
+
+  const periodsByLabel = new Map(
+    data.financialPeriods
+      .filter((p) => p.periodType === "QUARTER")
+      .map((p) => [p.periodLabel, p] as const),
+  );
+
+  const grossMarginRows = data.quarterlyQuality.filter((q) => q.metricCode === "QUALITY_GROSS_MARGIN");
+  const ocfNiRows = data.quarterlyQuality.filter((q) => q.metricCode === "QUALITY_OCF_TO_NET_INCOME");
+
+  const valueForQuarter = (rows: typeof grossMarginRows, label: string, asPercent = true): string => {
+    const row = rows.find((r) => r.periodLabel === label);
+    if (row?.value == null) return UNAVAILABLE;
+    return asPercent
+      ? `${(row.value * 100).toFixed(1).replace(".", ",")}%`
+      : `${row.value.toFixed(2).replace(".", ",")}x`;
+  };
+
+  const yoyForQuarter = (label: string, metricCode: string): number | null => {
+    const parts = label.split("-Q");
+    if (parts.length !== 2) return null;
+    const year = Number(parts[0]);
+    const quarter = Number(parts[1]);
+    const currentPeriod = periodsByLabel.get(label);
+    const priorPeriod = periodsByLabel.get(`${year - 1}-Q${quarter}`);
+    if (!currentPeriod || !priorPeriod) return null;
+    const current = factValue(currentPeriod, metricCode);
+    const prior = factValue(priorPeriod, metricCode);
+    if (current == null || prior == null || prior === 0) return null;
+    return ((current - prior) / Math.abs(prior)) * 100;
+  };
+
+  const q = (idx: number) => quarterlyPeriods[idx] ?? "";
+
+  // Resolve a quarter label back to its period so facts can be read from it.
+  const interestExpenseFor = (label: string) =>
+    formatInterestExpense(factValue(periodsByLabel.get(label), "INTEREST_EXPENSE_NON_OPERATING"));
+
+  const rows: StockDetail["thesisValidator"]["rows"] = [
+    {
+      item: "Revenue YoY (%)",
+      q3: formatPercentSigned(yoyForQuarter(q(0), "REVENUE")),
+      q4: formatPercentSigned(yoyForQuarter(q(1), "REVENUE")),
+      q1: formatPercentSigned(yoyForQuarter(q(2), "REVENUE")),
+      q2: formatPercentSigned(yoyForQuarter(q(3), "REVENUE")),
+      trend: formatPercentSigned(yoyForQuarter(q(3), "REVENUE")),
+      trendTone: trendToneFromValue(yoyForQuarter(q(3), "REVENUE")),
+    },
+    {
+      item: "Net Income YoY (%)",
+      q3: formatPercentSigned(yoyForQuarter(q(0), "EARNINGS")),
+      q4: formatPercentSigned(yoyForQuarter(q(1), "EARNINGS")),
+      q1: formatPercentSigned(yoyForQuarter(q(2), "EARNINGS")),
+      q2: formatPercentSigned(yoyForQuarter(q(3), "EARNINGS")),
+      trend: formatPercentSigned(yoyForQuarter(q(3), "EARNINGS")),
+      trendTone: trendToneFromValue(yoyForQuarter(q(3), "EARNINGS")),
+    },
+    {
+      item: "Gross Margin (Actual %)",
+      q3: valueForQuarter(grossMarginRows, q(0)),
+      q4: valueForQuarter(grossMarginRows, q(1)),
+      q1: valueForQuarter(grossMarginRows, q(2)),
+      q2: valueForQuarter(grossMarginRows, q(3)),
+      trend: valueForQuarter(grossMarginRows, q(3)),
+      trendTone: "slate",
+    },
+    {
+      item: "OCF / NI Ratio (x)",
+      q3: valueForQuarter(ocfNiRows, q(0), false),
+      q4: valueForQuarter(ocfNiRows, q(1), false),
+      q1: valueForQuarter(ocfNiRows, q(2), false),
+      q2: valueForQuarter(ocfNiRows, q(3), false),
+      trend: valueForQuarter(ocfNiRows, q(3), false),
+      trendTone: "slate",
+    },
+    {
+      // Interest expense is a quarterly fact; missing quarters are reported as
+      // unavailable rather than omitted, so the row always stays visible.
+      // Unit is BILLIONS of IDR: the workbook's "M Rp" label is misleading (see
+      // docs/reference/EXCEL_POSTGRES_VALIDATION.md Â§"Unit reality check").
+      item: "Interest Expense (Rp Bn)",
+      q3: interestExpenseFor(q(0)),
+      q4: interestExpenseFor(q(1)),
+      q1: interestExpenseFor(q(2)),
+      q2: interestExpenseFor(q(3)),
+      trend: interestExpenseFor(q(3)),
+      trendTone: "slate",
+    },
+  ];
+
+  return {
+    quarters: quarterlyPeriods.length > 0 ? quarterlyPeriods : [UNAVAILABLE],
+    rows,
+    footnote: "Based on the quarterly financial statements available in the database.",
+  };
+}
+
+function buildDividendConsistency(data: StockResearchData): StockDetail["dividendConsistency"] {
+  const percent = (value: number | null): string =>
+    value == null ? UNAVAILABLE : `${(value * 100).toFixed(1).replace(".", ",")}%`;
+
+  // The workbook's "Avg (4Y)" cell is the mean of the five displayed columns
+  // (projection + four fiscal years), verified against the sample workbooks:
+  // BIRD DPS (85.988+120+91+72+60)/5 = 85.7977. Columns with no value are
+  // excluded, and a row with no value at all stays "Not available".
+  const average = (values: (number | null)[]): number | null => {
+    const present = values.filter((value): value is number => value != null);
+    if (present.length === 0) return null;
+    return present.reduce((sum, value) => sum + value, 0) / present.length;
+  };
+
+  // DPS is indexed by fiscal year, never by position: a company that skipped a
+  // year (GEMA paid nothing in 2021-2023 and 2026) would otherwise shift its
+  // 2025 dividend into the 2026 column.
+  const dpsByYear: Record<string, number | null> = {};
+  for (const fact of data.dividends) {
+    if (fact.periodYear == null) continue;
+    dpsByYear[String(fact.periodYear)] = fact.amountPerShare;
+  }
+
+  // DPR and Dividend Yield are stored annual results (`DIVIDEND_PAYOUT_RATIO` /
+  // `DIVIDEND_YIELD`, workbook DataInput!B28/B29). One snapshot per year carries
+  // that year's own row, so index them by period label. They are read from the
+  // database rather than recomputed here: the yield denominator is a
+  // point-in-time year-end close the browser cannot reconstruct, because the
+  // price payload only carries the trailing window.
+  const ratioByYear = (metricCode: string): Record<string, number | null> => {
+    const map: Record<string, number | null> = {};
+    for (const row of data.annualGrowth) {
+      if (row.metricCode === metricCode) map[row.periodLabel] = row.value;
+    }
+    return map;
+  };
+  const dprByYear = ratioByYear("DIVIDEND_PAYOUT_RATIO");
+  const yieldByYear = ratioByYear("DIVIDEND_YIELD");
+
+  // The projection column is the active scenario, not a stored annual snapshot:
+  // `POTENTIAL_DPS` is the workbook's `Proj_DPS` (`B26 = IF(Proj_DPS="",0,...)`)
+  // and `average_dpr_ratio` is `Proj_Dividend_Payout_Ratio` (`B28`). Projected
+  // yield (`B29 = B26/B25`) divides by `Metric_Price_Current`, the latest close -
+  // deliberately a different basis from the historical year-end column.
+  const projection = data.projection;
+  const projectedDps = projection
+    ? projection.values.find((value) => value.metricCode === "POTENTIAL_DPS")?.value ?? null
+    : null;
+  const projectedDpr = projection?.averageDprRatio ?? null;
+  const latestPrice = data.prices.at(-1)?.closePrice ?? null;
+  const projectedYield =
+    projectedDps == null || latestPrice == null || latestPrice === 0
+      ? null
+      : projectedDps / latestPrice;
+
+  // Columns run from the projection year backwards, mirroring the workbook's
+  // `RIGHT(Years_Base_Selected,4)-1` ... `-4` headers.
+  const projectionYear = projection?.projectionYear ?? 2026;
+  const columnYears = [0, 1, 2, 3, 4].map((offset) => projectionYear - offset);
+  const PERIOD_KEYS = ["p2026", "y2025", "y2024", "y2023", "y2022"] as const;
+
+  const row = (
+    item: string,
+    values: (number | null)[],
+    formatter: (value: number | null) => string,
+  ): StockDetail["dividendConsistency"]["rows"][number] => {
+    const cells = PERIOD_KEYS.map((_, index) => values[index] ?? null);
+    return {
+      item,
+      p2026: formatter(cells[0]),
+      y2025: formatter(cells[1]),
+      y2024: formatter(cells[2]),
+      y2023: formatter(cells[3]),
+      y2022: formatter(cells[4]),
+      avg4Y: formatter(average(cells)),
+    };
+  };
+
+  const amount = (value: number | null): string =>
+    value == null ? UNAVAILABLE : value.toFixed(2);
+
+  const dpsValues = columnYears.map((year, index) =>
+    index === 0 ? projectedDps : dpsByYear[String(year)] ?? null,
+  );
+  const dprValues = columnYears.map((year, index) =>
+    index === 0 ? projectedDpr : dprByYear[String(year)] ?? null,
+  );
+  const yieldValues = columnYears.map((year, index) =>
+    index === 0 ? projectedYield : yieldByYear[String(year)] ?? null,
+  );
+
+  const dpsRow = row("DPS [Rp]", dpsValues, amount);
+  const dprRow = row("DPR [%]", dprValues, percent);
+  const yieldRow = row("Yield [%]", yieldValues, percent);
+
+  return {
+    // The card's headline yield is the same "Avg (4Y)" the table shows, so the
+    // two can never disagree.
+    averageYield: yieldRow.avg4Y,
+    years: [
+      ...columnYears.map((year, index) =>
+        index === 0 ? `${year} (Proyeksi)` : String(year),
+      ),
+      "Avg (4Y)",
+    ],
+    rows: [dpsRow, dprRow, yieldRow],
+    callout: buildDividendCallout({
+      hasDividends: data.dividends.length > 0,
+      hasDpr: dprValues.some((value) => value != null),
+      hasYield: yieldValues.some((value) => value != null),
+    }),
+  };
+}
+
+/**
+ * The dividend card's callout. It only claims what the database actually holds,
+ * so a ticker whose dividend ratios could not be computed (missing DPS or no
+ * year-end price) says so instead of showing a silent gap.
+ */
+function buildDividendCallout({
+  hasDividends,
+  hasDpr,
+  hasYield,
+}: {
+  hasDividends: boolean;
+  hasDpr: boolean;
+  hasYield: boolean;
+}): string {
+  if (!hasDividends) return "No historical dividend data for this ticker.";
+  if (hasDpr && hasYield) {
+    return "DPS, DPR and dividend yield are stored calculation results. Yield uses the point-in-time year-end close, not the latest price.";
+  }
+  if (hasDpr || hasYield) {
+    return "DPS is stored directly; only one of DPR or dividend yield could be computed for this ticker because an input is missing.";
+  }
+  return "DPS is stored directly. DPR and dividend yield need a recorded dividend and a year-end price, which are not available for this ticker yet.";
+}
+
+function buildGrowthSummary(data: StockResearchData): StockDetail["growthSummary"] {
+  const revenueCagrShort = findAnnualMetric(data, "GROWTH_REVENUE_CAGR_SHORT").value;
+  const epsCagrShort = findAnnualMetric(data, "GROWTH_EPS_CAGR_SHORT").value;
+  const latestAnnualPeriod = data.financialPeriods
+    .filter((period) => period.periodType === "ANNUAL")
+    .sort((left, right) => left.periodEnd.localeCompare(right.periodEnd))
+    .at(-1);
+  const previousThreeYearPeriod = data.financialPeriods
+    .filter((period) => period.periodType === "ANNUAL")
+    .sort((left, right) => left.periodEnd.localeCompare(right.periodEnd))
+    .find((period) => Number(period.periodLabel) === Number(latestAnnualPeriod?.periodLabel) - 3);
+  const latestEarnings = factValue(latestAnnualPeriod, "EARNINGS");
+  const startingEarnings = factValue(previousThreeYearPeriod, "EARNINGS");
+  const netIncomeCagr = latestEarnings != null && startingEarnings != null && startingEarnings > 0 && latestEarnings > 0
+    ? (latestEarnings / startingEarnings) ** (1 / 3) - 1
+    : null;
+  const annualPeriods = data.financialPeriods
+    .filter((period) => period.periodType === "ANNUAL")
+    .sort((left, right) => left.periodEnd.localeCompare(right.periodEnd));
+  const previousAnnualPeriod = annualPeriods.at(-2);
+  const latestRevenue = factValue(latestAnnualPeriod, "REVENUE");
+  const previousRevenue = factValue(previousAnnualPeriod, "REVENUE");
+  const previousEarnings = factValue(previousAnnualPeriod, "EARNINGS");
+  const latestOcf = factValue(latestAnnualPeriod, "OPERATING_CASH_FLOW");
+  const annualGrowth = (latest: number | null, previous: number | null) =>
+    latest != null && previous != null && previous !== 0
+      ? formatPercentSigned(((latest - previous) / Math.abs(previous)) * 100)
+      : UNAVAILABLE;
+  const latestAnnualGrossMargin = data.annualRatios
+    .filter((row) => row.metricCode === "GROSS_MARGIN")
+    .at(-1)?.value ?? null;
+  const latestAnnualOcfNi = latestEarnings != null && latestOcf != null && latestEarnings !== 0
+    ? `${(latestOcf / latestEarnings).toFixed(2).replace(".", ",")}x`
+    : UNAVAILABLE;
+
+  const metrics: StockDetail["growthSummary"]["metrics"] = [
+    {
+      label: "Revenue Growth (3Y CAGR)",
+      value: formatCagr(revenueCagrShort),
+      badge: badgeFromGrowth(revenueCagrShort),
+      subtext: "Calculated from historical data in the database",
+    },
+    {
+      label: "Net Income Growth (3Y CAGR)",
+      value: formatCagr(netIncomeCagr),
+      badge: badgeFromGrowth(netIncomeCagr),
+      subtext: previousThreeYearPeriod && latestAnnualPeriod
+        ? `Calculated from ${previousThreeYearPeriod.periodLabel}â€“${latestAnnualPeriod.periodLabel} net income`
+        : "Requires positive net income across the three-year period",
+    },
+    {
+      label: "EPS Growth (3Y CAGR)",
+      value: formatCagr(epsCagrShort),
+      badge: badgeFromGrowth(epsCagrShort),
+      subtext: "Calculated from historical data in the database",
+    },
+  ];
+
+  return {
+    metrics,
+    annualPerformance: {
+      revenueGrowth: annualGrowth(latestRevenue, previousRevenue),
+      netIncomeGrowth: annualGrowth(latestEarnings, previousEarnings),
+      grossMargin: latestAnnualGrossMargin == null
+        ? UNAVAILABLE
+        : `${(latestAnnualGrossMargin * 100).toFixed(1).replace(".", ",")}%`,
+      ocfNetIncome: latestAnnualOcfNi,
+      period: latestAnnualPeriod && previousAnnualPeriod
+        ? `FY${latestAnnualPeriod.periodLabel} vs FY${previousAnnualPeriod.periodLabel}`
+        : "Annual data unavailable",
+    },
+  };
+}
+
+function buildFinancialHealth(data: StockResearchData): StockDetail["financialHealth"] {
+  const roe = findQuarterlyMetric(data, "QUALITY_ROE").value;
+  const ocfNi = findQuarterlyMetric(data, "QUALITY_OCF_TO_NET_INCOME").value;
+  const grossMargin = findQuarterlyMetric(data, "QUALITY_GROSS_MARGIN").value;
+
+  const metrics: NonNullable<StockDetail["financialHealth"]>["metrics"] = [
+    {
+      label: "Return on Equity (ROE)",
+      value: roe != null ? `${(roe * 100).toFixed(2).replace(".", ",")}%` : UNAVAILABLE,
+      badge: roe != null && roe > 0.1 ? "Healthy" : roe != null ? "Stable" : "Caution",
+      subtext: "Latest quarter from the database",
+    },
+    {
+      label: "Gross Margin",
+      value: grossMargin != null ? `${(grossMargin * 100).toFixed(2).replace(".", ",")}%` : UNAVAILABLE,
+      badge: grossMargin != null ? "Stable" : "Caution",
+      subtext: "Latest quarter from the database",
+    },
+    {
+      label: "OCF / Net Income",
+      value: ocfNi != null ? `${ocfNi.toFixed(2).replace(".", ",")}x` : UNAVAILABLE,
+      badge: ocfNi != null && ocfNi >= 1 ? "Healthy" : ocfNi != null ? "Stable" : "Caution",
+      subtext: "Latest quarter from the database",
+    },
+  ];
+
+  return { metrics };
+}
+
+/**
+ * Build the backtest tab payload from stored results.
+ *
+ * Replaces the sample dataset. `isDemoData` is deliberately NOT set, so the
+ * "Demo Data" badge disappears on its own once the numbers are real (section
+ * 5.2 of the architecture doc) instead of needing a second flag to keep in sync.
+ */
+function buildBacktest(data: BacktestData | null | undefined): StockDetail["backtest"] {
+  if (!data || data.cases.length === 0) return undefined;
+
+  return {
+    cases: data.cases.map((testCase) =>
+      buildBacktestCase(testCase, data.ticker, data.sectorName),
+    ),
+    methodology: {
+      processSteps: [
+        {
+          number: "01",
+          title: "Identify the Condition",
+          text: "Each historical quarter is classified as Undervalued, Overvalued, or Mixed using the valuation framework available on the analysis date.",
+        },
+        {
+          number: "02",
+          title: "Track Price Movement",
+          text: "After the analysis date, price movement is observed for up to 12 months against predefined upside and downside thresholds.",
+        },
+        {
+          number: "03",
+          title: "Determine the Outcome",
+          text: "The first threshold reached determines the historical outcome. This is evidence of past behavior, not a prediction or recommendation.",
+        },
+      ],
+    },
+  };
+}
+
+/**
+ * Build the sample-data version of the Historical Evidence preview.
+ *
+ * The sample backtest cases stay the single source of truth for the demo
+ * ticker, so the preview is computed from them with the same aggregation the
+ * stored path uses instead of being a second set of hand-written numbers that
+ * could drift from the tab next to it.
+ */
+/**
+ * Growth-quality / forensic cards from the stored annual metrics and facts.
+ *
+ * Ten cards mirror the workbook's business-quality and forensic-check groups:
+ * profitability (ROE, gross margin, cash-conversion quality), trend quality
+ * (ROE trend, equity growth consistency) and balance-sheet forensics (current
+ * asset growth, asset growth gap, NWC intensity and the cash-flow check). Every
+ * card reads or derives from stored rows; a missing input renders
+ * "Not available" instead of a fabricated value.
+ */
+function buildForensicMetrics(
+  data: StockResearchData,
+): StockDetail["healthGrowth"]["forensic"]["metrics"] {
+  const annualPeriods = data.financialPeriods
+    .filter((period) => period.periodType === "ANNUAL")
+    .sort((left, right) => left.periodEnd.localeCompare(right.periodEnd));
+
+  // A stored annual ratio (ROE, gross margin) per year, keyed by period label.
+  const ratioByYear = (metricCode: string): Map<string, number | null> => {
+    const map = new Map<string, number | null>();
+    for (const row of data.annualRatios) {
+      if (row.metricCode === metricCode) map.set(row.periodLabel, row.value);
+    }
+    return map;
+  };
+
+  const seriesOf = (metricCode: string): (number | null)[] => {
+    const byYear = ratioByYear(metricCode);
+    return annualPeriods.map((period) => byYear.get(period.periodLabel) ?? null);
+  };
+
+  const defined = (series: (number | null)[]): number[] =>
+    series.filter((value): value is number => value != null);
+
+  const percent = (value: number | null) =>
+    value == null ? UNAVAILABLE : `${(value * 100).toFixed(2).replace(".", ",")}%`;
+  const ppt = (value: number | null) =>
+    value == null
+      ? UNAVAILABLE
+      : `${value >= 0 ? "+" : ""}${(value * 100).toFixed(2).replace(".", ",")} ppt`;
+
+  // --- Profitability quality -------------------------------------------------
+  const roeSeries = defined(seriesOf("ROE"));
+  const latestRoe = roeSeries.at(-1) ?? null;
+  const priorRoe = roeSeries.slice(0, -1);
+  const priorRoeAverage =
+    priorRoe.length > 0 ? priorRoe.reduce((sum, value) => sum + value, 0) / priorRoe.length : null;
+
+  // The quarterly margin is fresher; fall back to the latest annual margin when
+  // no quarterly row is stored.
+  const grossMargin =
+    findQuarterlyMetric(data, "QUALITY_GROSS_MARGIN").value ??
+    (defined(seriesOf("GROSS_MARGIN")).at(-1) ?? null);
+
+  const latestAnnual = annualPeriods.at(-1);
+  const latestOcf = factValue(latestAnnual, "OPERATING_CASH_FLOW");
+  const latestNetIncome = factValue(latestAnnual, "EARNINGS");
+  const ocfNi =
+    latestOcf != null && latestNetIncome != null && latestNetIncome !== 0
+      ? latestOcf / latestNetIncome
+      : null;
+  const cashConversion =
+    ocfNi == null ? UNAVAILABLE : ocfNi >= 1 ? "Strong" : ocfNi >= 0.5 ? "Moderate" : "Weak";
+
+  // --- Trend quality ---------------------------------------------------------
+  const roeTrend =
+    latestRoe == null || priorRoeAverage == null
+      ? UNAVAILABLE
+      : latestRoe > priorRoeAverage + 0.005
+        ? "Improving"
+        : latestRoe < priorRoeAverage - 0.005
+          ? "Declining"
+          : "Stable";
+
+  const equitySeries = defined(annualPeriods.map((period) => factValue(period, "TOTAL_EQUITY")));
+  const latestEquity = equitySeries.at(-1) ?? null;
+  const previousEquity = equitySeries.at(-2) ?? null;
+  const equityGrowth =
+    latestEquity != null && previousEquity != null && previousEquity !== 0
+      ? (latestEquity - previousEquity) / Math.abs(previousEquity)
+      : null;
+  const equityConsistency = equitySeries.some((value) => value < 0)
+    ? "Negative Equity"
+    : equityGrowth == null
+      ? UNAVAILABLE
+      : equityGrowth > 0.05
+        ? "Consistent"
+        : "Stagnant / Erosion";
+
+  // --- Balance-sheet forensics ----------------------------------------------
+  const currentAssetYoY = findAnnualMetric(data, "GROWTH_CURRENT_ASSET_YOY").value;
+  const revenueYoY = findAnnualMetric(data, "GROWTH_REVENUE_YOY").value;
+  const assetGrowthGap = findAnnualMetric(data, "GROWTH_ASSET_GROWTH_GAP").value;
+  const nwcToRevenue = findAnnualMetric(data, "QUALITY_NWC_TO_REVENUE").value;
+  const nwcChange = findAnnualMetric(data, "QUALITY_NWC_INTENSITY_CHANGE").value;
+
+  // Projected operating cash flow against projected net income (workbook `B69`).
+  const projected = (metricCode: string) =>
+    data.projection?.values.find((value) => value.metricCode === metricCode)?.value ?? null;
+  const projectedOcf = projected("OPERATING_CASH_FLOW");
+  const projectedNetIncome = projected("EARNINGS");
+  const cashFlowCheck =
+    projectedOcf == null || projectedNetIncome == null
+      ? UNAVAILABLE
+      : projectedOcf < 0.5 * projectedNetIncome
+        ? "Warning: Low Cash"
+        : "OK";
+
+  const assetOutpacesRevenue =
+    currentAssetYoY != null && revenueYoY != null && currentAssetYoY > revenueYoY;
+
+  return [
+    {
+      label: "Return on Equity (ROE)",
+      value: percent(latestRoe),
+      context: "Latest reported return on equity",
+      tone: latestRoe == null ? "neutral" : latestRoe > 0 ? "positive" : "negative",
+    },
+    {
+      label: "Gross Margin",
+      value: percent(grossMargin),
+      context: "Latest reported gross margin",
+      tone: "neutral",
+    },
+    {
+      label: "Quality: CF vs Net Income",
+      value: cashConversion,
+      context: "Operating cash flow versus reported earnings",
+      tone:
+        ocfNi == null ? "neutral" : ocfNi >= 1 ? "positive" : ocfNi >= 0.5 ? "neutral" : "negative",
+    },
+    {
+      label: "ROE Trend",
+      value: roeTrend,
+      context: "Latest return on equity versus its historical average",
+      tone: roeTrend === "Improving" ? "positive" : roeTrend === "Declining" ? "negative" : "neutral",
+    },
+    {
+      label: "Equity Growth Consistency",
+      value: equityConsistency,
+      context: "Year-over-year change in total equity",
+      tone:
+        equityConsistency === "Consistent"
+          ? "positive"
+          : equityConsistency === UNAVAILABLE
+            ? "neutral"
+            : "negative",
+    },
+    {
+      label: "Current Asset Growth (YoY)",
+      value: percent(currentAssetYoY),
+      context: assetOutpacesRevenue
+        ? "Current assets grew faster than revenue"
+        : "Current asset growth is in line with revenue",
+      tone: currentAssetYoY == null ? "neutral" : assetOutpacesRevenue ? "negative" : "positive",
+    },
+    {
+      label: "Asset Growth Gap (YoY)",
+      value: percent(assetGrowthGap),
+      context:
+        assetGrowthGap == null
+          ? "Revenue growth versus current-asset growth"
+          : assetGrowthGap >= 0
+            ? "Revenue is keeping pace with asset growth"
+            : "Current assets grew faster than revenue",
+      tone: assetGrowthGap == null ? "neutral" : assetGrowthGap >= 0 ? "positive" : "negative",
+    },
+    {
+      label: "NWC / Revenue (Latest)",
+      value: percent(nwcToRevenue),
+      context: "Net working capital intensity",
+      tone: "neutral",
+    },
+    {
+      label: "NWC Intensity Change (YoY)",
+      value: ppt(nwcChange),
+      context:
+        nwcChange == null
+          ? "Change in net working capital intensity"
+          : nwcChange > 0
+            ? "Working capital intensity needs monitoring"
+            : "Working capital intensity is easing",
+      tone: nwcChange == null ? "neutral" : nwcChange > 0 ? "negative" : "positive",
+    },
+    {
+      label: "Cash Flow Check",
+      value: cashFlowCheck,
+      context: "Projected operating cash flow versus projected earnings",
+      tone: cashFlowCheck === "OK" ? "positive" : cashFlowCheck === UNAVAILABLE ? "neutral" : "negative",
+    },
+  ];
+}
+
+/** Key per-share valuation metrics for the Valuation tab, from stored facts. */
+function buildValuationMetrics(
+  data: StockResearchData,
+  currentPrice: number | null,
+): StockDetail["currentValuation"]["metrics"] {
+  const notAvailable = "N/A";
+  // EPS and BVPS are the stored annual ratios for the latest year, so the
+  // Valuation tab and the Financials tab cannot disagree. They used to be
+  // recomputed here from `EARNINGS / shares` with a per-year share count, which
+  // is a different (and non-template) divisor.
+  const latestRatio = (metricCode: string): { value: number | null; periodLabel: string } => {
+    const rows = data.annualRatios.filter((row) => row.metricCode === metricCode);
+    const latest = rows.at(-1);
+    return {
+      value: latest?.calculationStatus === "VALID" ? latest.value : null,
+      periodLabel: latest?.periodLabel ?? notAvailable,
+    };
+  };
+  const epsMetric = latestRatio("EPS");
+  const bvpsMetric = latestRatio("BVPS");
+  const roeMetric = latestRatio("ROE");
+  const earningsGrowthMetric = latestRatio("EARNINGS_CAGR_WINDOW");
+  const dividendYieldRows = data.annualGrowth.filter((row) => row.metricCode === "DIVIDEND_YIELD");
+  const latestDividendYield = dividendYieldRows.at(-1);
+  const eps = epsMetric.value;
+  const bvps = bvpsMetric.value;
+
+  const multiple = (numerator: number | null, denominator: number | null) =>
+    numerator == null || denominator == null || denominator <= 0
+      ? notAvailable
+      : `${(numerator / denominator).toFixed(2).replace(".", ",")}x`;
+
+  return [
+    {
+      label: "EPS (TTM)",
+      value: eps ?? notAvailable,
+      note: "Net income / share",
+    },
+    {
+      label: "BVPS",
+      value: bvps ?? notAvailable,
+      note: "Book equity / share",
+    },
+    { label: "P/E Ratio", value: multiple(currentPrice, eps), note: "Price / EPS" },
+    { label: "P/BV Ratio", value: multiple(currentPrice, bvps), note: "Price / BVPS" },
+    {
+      label: "ROE",
+      value: roeMetric.value == null ? notAvailable : `${(roeMetric.value * 100).toFixed(2).replace(".", ",")}%`,
+      note: roeMetric.periodLabel,
+    },
+    {
+      label: "Earnings Growth (CAGR)",
+      value: earningsGrowthMetric.value == null ? notAvailable : formatCagr(earningsGrowthMetric.value),
+      note: earningsGrowthMetric.periodLabel,
+    },
+    {
+      label: "Dividend Yield",
+      value: latestDividendYield?.calculationStatus === "VALID" && latestDividendYield.value != null
+        ? `${(latestDividendYield.value * 100).toFixed(2).replace(".", ",")}%`
+        : notAvailable,
+      note: latestDividendYield?.periodLabel ?? notAvailable,
+    },
+  ];
+}
+
+/**
+ * The price RPC returns up to 260 rows of **daily** closes. The chart works in
+ * months (3M/6M/9M/12M), so the series is collapsed to one point per calendar
+ * month using the last close of that month. Rows without a usable date are
+ * skipped instead of being mislabelled.
+ */
+function buildMonthlyPricePoints(prices: StockPrice[]): { date: string; value: number }[] {
+  const lastCloseByMonth = new Map<string, number>();
+
+  for (const price of prices) {
+    if (price.closePrice == null) continue;
+    const label = toMonthLabel(price.tradingDate);
+    if (label == null) continue;
+    // Rows arrive oldest-first, so later rows overwrite earlier ones and the
+    // map keeps the final close of each month.
+    lastCloseByMonth.set(label, price.closePrice);
+  }
+
+  return [...lastCloseByMonth]
+    .map(([date, value]) => ({ date, value }))
+    .sort((a, b) => (toMonthIndex(a.date) ?? 0) - (toMonthIndex(b.date) ?? 0));
+}
+
+export function buildStockDetail(
+  data: StockResearchData,
+  backtest?: BacktestData | null,
+  valuationSummary?: ValuationSummary | null,
+): StockDetail {
+  const valuationMethods = valuationSummary?.methods ?? data.valuationMethods;
+  const storedBacktest = buildBacktest(backtest);
+  const backtestSection = storedBacktest;
+  // The Overview preview reads the same cases the Backtest tab does, so both
+  // screens report one set of numbers.
+  const evidencePreview = buildHistoricalEvidencePreview(backtestSection?.cases ?? []);
+  // The Key Metric headline figures are the win rates of both rules, read from
+  // the same preview the Overview panel renders so the top row and the panel
+  // cannot drift apart.
+  const evidenceWinRates = {
+    method: formatEvidenceWinRate(evidencePreview?.verdictMethod),
+    mos: formatEvidenceWinRate(evidencePreview?.verdictMos),
+  };
+  // Stock type comes from the stored rows, not from the chosen main method, so
+  // the fallback below cannot change what type the ticker is.
+  const stockType = valuationSummary?.stockType ?? valuationSummary?.methods?.[0]?.stockType ?? data.valuationMethods[0]?.stockType ?? UNAVAILABLE;
+  const mainMethodCode = valuationSummary?.mosMethodCode ?? null;
+  const mainMethod = mainMethodCode
+    ? valuationMethods.find((method) => method.methodCode === mainMethodCode) ?? null
+    : valuationSummary?.methods?.length
+      ? null
+      : legacyMainMethod(data.valuationMethods, stockType);
+  const mosVerdict = mapSummaryVerdict(valuationSummary?.mosVerdict);
+  const latestPrice = data.prices.at(-1);
+  const previousPrice = data.prices.at(-2);
+
+  const price = latestPrice?.closePrice ?? null;
+  const change =
+    price != null && previousPrice?.closePrice != null ? price - previousPrice.closePrice : null;
+  const changePercent =
+    change != null && previousPrice?.closePrice ? (change / previousPrice.closePrice) * 100 : null;
+
+  const intrinsicValue = mainMethod?.intrinsicValue ?? null;
+  const currentPrice = valuationSummary?.currentPrice ?? mainMethod?.currentPrice ?? price;
+  // Read from the stored row rather than recomputed: the backend owns rule D6.
+  const mos = mainMethod ? formatStoredMos(mainMethod) : null;
+  const verdict = mapVerdict(mainMethod?.verdict);
+  const methodVerdict = mapSummaryVerdict(valuationSummary?.methodVerdict);
+
+  const prices52w = data.prices.filter((p) => p.closePrice != null).map((p) => p.closePrice as number);
+  const low52W = prices52w.length > 0 ? Math.min(...prices52w) : null;
+  const high52W = prices52w.length > 0 ? Math.max(...prices52w) : null;
+  const latestMarketCap = latestPrice?.marketCap ?? null;
+
+  const methods: import("@/data/stock-detail-types").ValuationMethodResult[] = sortValuationMethods(
+    valuationMethods
+      // `APPROXIMATED` rows carry a real computed intrinsic value (the engine only
+      // proxied an input, e.g. quarterly shares -> latest annual figure), so they
+      // must be shown. Dropping them hid the whole Mean Reversion PBV method.
+      // `UNAVAILABLE` rows have no value and stay out.
+      .filter(
+        (m) =>
+          m.intrinsicValue != null &&
+          (m.calculationStatus === "VALID" || m.calculationStatus === "APPROXIMATED"),
+      ),
+  ).map((m) => {
+    const marginOfSafety = formatStoredMos(m);
+    return {
+      method: methodDisplayName(m.methodCode),
+      methodCode: m.methodCode,
+      intrinsicValue: m.intrinsicValue as number,
+      marginOfSafety: formatPercentSigned(marginOfSafety),
+      // The stored verdict already says NOT_APPLICABLE for every `IV <= 0` row,
+      // so it is read rather than re-derived. Forcing the leftover values to
+      // OVERVALUED is what used to label a skipped DDM as "overvalued".
+      status: methodStatus(m.intrinsicValue as number, m.verdict),
+      description: valuationMethodDescription(m.methodCode),
+    };
+  });
+  const consensusMethods = methods.filter((method) => method.status !== "SKIPPED");
+  const undervaluedMethodCount = consensusMethods.filter(
+    (method) => method.status === "UNDERVALUED",
+  ).length;
+  const undervaluedConsensus = consensusMethods.length > 0 && undervaluedMethodCount >= 3;
+  const methodSignal = methodVerdict === "UNDERVALUED" || methodVerdict === "OVERVALUED"
+    ? methodVerdict
+    : null;
+  const marginSignal = mosVerdict === "UNDERVALUED" || mosVerdict === "OVERVALUED"
+    ? mosVerdict
+    : null;
+  const valuationSignal: StockDetail["valuationSignal"] = methodSignal && marginSignal
+    ? methodSignal === marginSignal ? methodSignal : "MIXED"
+    : methodSignal
+      ? methodSignal
+      : marginSignal
+        ? marginSignal
+        : "NOT AVAILABLE";
+  const valuationSignalDescription = valuationSignal === "UNDERVALUED"
+    ? methodSignal && marginSignal
+      ? "Both valuation signals indicate undervaluation."
+      : "Available valuation signal indicates undervaluation."
+    : valuationSignal === "OVERVALUED"
+      ? methodSignal && marginSignal
+        ? "Both valuation signals indicate overvaluation."
+        : "Available valuation signal indicates overvaluation."
+      : valuationSignal === "MIXED"
+        ? "Valuation signals point in different directions."
+        : "Valuation signals are not available.";
+  const comparableMethods = methods.filter(
+    (method) => method.intrinsicValue !== 0 && method.status !== "SKIPPED",
+  );
+  const intrinsicValues = comparableMethods.map((method) => method.intrinsicValue);
+  const undervaluedCount = comparableMethods.filter((method) => method.status === "UNDERVALUED").length;
+  const valuationReadouts = [
+    comparableMethods.length > 0
+      ? `${undervaluedCount} of ${comparableMethods.length} valid methods indicate Undervalued`
+      : "Undervalued methods: N/A (no valid valuation methods)",
+    intrinsicValues.length > 0
+      ? `Highest intrinsic value: ${formatRupiah(Math.max(...intrinsicValues))}`
+      : "Highest intrinsic value: N/A",
+    intrinsicValues.length > 0
+      ? `Lowest intrinsic value: ${formatRupiah(Math.min(...intrinsicValues))}`
+      : "Lowest intrinsic value: N/A",
+  ];
+
+  return {
+    ticker: data.instrument.ticker,
+    companyName: data.instrument.companyName ?? data.instrument.ticker,
+    sector: data.instrument.sectorName ?? UNAVAILABLE,
+    stockType,
+    price,
+    change,
+    changePercent,
+    updatedAt: latestPrice?.tradingDate ?? UNAVAILABLE,
+    verdict,
+    valuationSignal,
+    verdictDescription: valuationSignalDescription,
+    intrinsicValue,
+    mos,
+    stockCharacter: stockType,
+    stockCharacterDesc: stockType !== UNAVAILABLE ? "Stock type classification" : UNAVAILABLE,
+    undervaluedMethods: consensusMethods.length > 0
+      ? `${undervaluedMethodCount}/${consensusMethods.length}`
+      : UNAVAILABLE,
+    undervaluedMethodsVerdict: consensusMethods.length > 0
+      ? undervaluedConsensus ? "UNDERVALUED" : "OVERVALUED"
+      : null,
+    evidenceWinRates,
+    researchSummary: mainMethod
+      ? `${data.instrument.ticker} was evaluated using the ${methodDisplayName(mainMethod.methodCode)} valuation model based on the latest database data.`
+      : `No stored valuation result for ${data.instrument.ticker} in the database.`,
+    methodologyUrl: "#",
+    companyProfile: {
+      description: `${data.instrument.companyName ?? data.instrument.ticker} â€” the full company description is not available in the database yet.`,
+      sector: data.instrument.sectorName ?? UNAVAILABLE,
+      stockType,
+      listedDate: UNAVAILABLE,
+      headquarters: UNAVAILABLE,
+      website: UNAVAILABLE,
+    },
+    priceChart: {
+      timeframe: "1Y",
+      points: buildMonthlyPricePoints(data.prices),
+      low52W,
+      high52W,
+      ytdPercent: changePercent,
+      marketCap:
+        latestMarketCap != null ? `Rp${(latestMarketCap / 1_000_000_000_000).toFixed(2)} T` : UNAVAILABLE,
+      peTTM: null,
+    },
+    currentValuation: {
+      verdict,
+      currentPrice,
+      intrinsicValue,
+      mos,
+      methodVerdict,
+      mosVerdict,
+      mosThreshold: valuationSummary?.mosThreshold ?? null,
+      metrics: buildValuationMetrics(data, currentPrice),
+      methods,
+      mainMethodCode: mainMethodCode as ValuationMethodCode | null,
+      comparison: {
+        takeaway: mainMethod
+          ? "Comparison of the current price against the intrinsic value estimates from the valuation methods stored in the database."
+          : "No stored valuation result for this ticker.",
+        readouts: valuationReadouts,
+      },
+    },
+    financialHealth: buildFinancialHealth(data),
+    healthGrowth: {
+      periodOptions: ["Quarterly"],
+      defaultPeriod: "Quarterly",
+      growth: {
+        revenueHistorical: {
+          value: formatCagr(findAnnualMetric(data, "GROWTH_REVENUE_CAGR_LONG").value),
+          period: "Historical",
+        },
+        revenueFiveYear: {
+          value: formatCagr(findAnnualMetric(data, "GROWTH_REVENUE_CAGR_SHORT").value),
+          period: "5 Year",
+        },
+        revenueYoY: {
+          value: formatCagr(findAnnualMetric(data, "GROWTH_REVENUE_YOY").value),
+          period: "YoY",
+        },
+        revenueMomentum: {
+          value: findAnnualMetric(data, "QUALITY_REVENUE_MOMENTUM").value === 1 ? "Accelerating" : UNAVAILABLE,
+          period: "Current",
+          tone: findAnnualMetric(data, "QUALITY_REVENUE_MOMENTUM").value === 1 ? "positive" : "neutral",
+        },
+        epsHistorical: {
+          value: formatCagr(findAnnualMetric(data, "GROWTH_EPS_CAGR_LONG").value),
+          period: "Historical",
+        },
+        epsFiveYear: {
+          value: formatCagr(findAnnualMetric(data, "GROWTH_EPS_CAGR_SHORT").value),
+          period: "5 Year",
+        },
+        epsMomentum: {
+          value: findAnnualMetric(data, "QUALITY_EPS_MOMENTUM").value === 1 ? "Accelerating" : UNAVAILABLE,
+          period: "Current",
+          tone: findAnnualMetric(data, "QUALITY_EPS_MOMENTUM").value === 1 ? "positive" : "neutral",
+        },
+      },
+      growthVisuals: buildGrowthVisuals(data),
+      profitability: { metrics: [] },
+      cashFlow: { metrics: [] },
+      forensic: { metrics: buildForensicMetrics(data) },
+      quarterlyMeaning: "No automatic quarterly quality summary for this ticker yet.",
+      overall: { score: UNAVAILABLE, rating: UNAVAILABLE, clearance: UNAVAILABLE, context: UNAVAILABLE },
+    },
+    growthSummary: buildGrowthSummary(data),
+    historicalEvidencePreview: evidencePreview ?? undefined,
+    backtest: backtestSection,
+    thesisValidator: buildThesisValidator(data),
+    dividendConsistency: buildDividendConsistency(data),
+    financialHistory: buildFinancialHistory(
+      data.financialPeriods,
+      data.annualRatios,
+      data.quarterlyQuality,
+    ),
+  };
+}
+

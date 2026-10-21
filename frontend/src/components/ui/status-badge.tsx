@@ -1,0 +1,49 @@
+import React from "react";
+
+type BadgeTone =
+  | "undervalued"
+  | "fairly-valued"
+  | "overvalued"
+  | "healthy"
+  | "positive"
+  | "info"
+  | "stable"
+  | "cukup"
+  | "caution"
+  | "skipped";
+
+export function StatusBadge({
+  tone = "positive",
+  children,
+  className = "",
+}: {
+  tone?: BadgeTone;
+  children: React.ReactNode;
+  className?: string;
+}) {
+  const toneClasses: Record<BadgeTone, string> = {
+    undervalued: "border-[#1fcf86]/40 bg-[#0d2b22] text-[#3ef0a9]",
+    healthy: "border-[#1fcf86]/40 bg-[#0d2b22] text-[#3ef0a9]",
+    positive: "border-[#1fcf86]/40 bg-[#0d2b22] text-[#3ef0a9]",
+    info: "border-[#3892d0]/45 bg-[#102b43] text-[#75c5ff]",
+    "fairly-valued": "border-[#c79d51]/40 bg-[#2f2717] text-[#f1c56d]",
+    stable: "border-[#c79d51]/40 bg-[#2f2717] text-[#f1c56d]",
+    cukup: "border-[#d9a23c]/40 bg-[#2b2212] text-[#eab308]",
+    caution: "border-[#ff4b5f]/35 bg-[#32161e] text-[#ff5f73]",
+    overvalued: "border-[#ff4b5f]/35 bg-[#32161e] text-[#ff5f73]",
+    // Neutral, not red: a skipped method is "not applicable", not a verdict.
+    skipped: "border-[#8f9db1]/30 bg-[#1a2332]/60 text-[#9aa9bf]",
+  };
+
+  return (
+    <span
+      className={[
+        "inline-flex max-w-full items-center rounded-lg border px-2.5 py-1 text-xs font-semibold tracking-wide transition",
+        toneClasses[tone] ?? toneClasses.positive,
+        className,
+      ].join(" ")}
+    >
+      {children}
+    </span>
+  );
+}
